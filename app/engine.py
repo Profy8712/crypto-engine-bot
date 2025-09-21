@@ -10,6 +10,7 @@ class Engine:
     def run(self, config_path: str):
         cfg = self._load_config(config_path)
         print(f"📌 Opening {cfg.side} {cfg.symbol} qty={cfg.base_order_qty}")
+
         if cfg.entry.type == "market":
             order = self.ex.place_market_order(cfg.symbol, cfg.side, cfg.base_order_qty)
             print("✅ Market order placed:", order)

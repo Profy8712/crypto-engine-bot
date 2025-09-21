@@ -11,10 +11,24 @@ class CcxtClient(Exchange):
         if not ccxt_id:
             raise ValueError(f"Unknown exchange: {ex_name}")
 
-        self.client = getattr(ccxt, ccxt_id)()
+        api_key = os.getenv("API_KEY")
+        api_secret = os.getenv("API_SECRET")
+        testnet = os.getenv("TESTNET", "true").lower() == "true"
+
+        # передаём ключи в клиент
+        self.client = getattr(ccxt, ccxt_id)({
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": True,
+        })
+
+        # включаем тестнет (если поддерживается)
         if hasattr(self.client, "set_sandbox_mode"):
-            testnet = os.getenv("TESTNET", "true").lower() == "true"
             self.client.set_sandbox_mode(testnet)
+
+        # для Bybit лучше указать unified/swap тип (иначе может путаться)
+        if ccxt_id == "bybit":
+            self.client.options = { **self.client.options, "defaultType": "swap" }
 
     def last_price(self, symbol: str) -> float:
         ticker = self.client.fetch_ticker(symbol)
