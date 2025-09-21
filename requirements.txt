@@ -1,0 +1,3 @@
+ccxt
+pydantic
+python-dotenv
