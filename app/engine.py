@@ -50,10 +50,10 @@ class Engine:
             entry_side = side_to_order(cfg.side)
             last = self._last(cfg)
             raw_qty = cfg.market_order_amount / last
-            qty = self.ex.round_amount(cfg.symbol, raw_qty)
-            min_amt = self.ex.min_amount(cfg.symbol)
-            if qty <= 0 or qty < min_amt:
-                raise ValueError(f"Calculated market qty {qty} < min amount {min_amt}")
+            qty = self.ex.round_amount_down(cfg.symbol, raw_qty)
+            min_trade = self.ex.min_tradable_amount(cfg.symbol)
+            if qty < min_trade:
+                raise ValueError(f"Calculated market qty {qty} < min tradable {min_trade}")
             order = self.ex.place_market_order(cfg.symbol, entry_side, qty, reduce_only=False)
             logger.info(f"✅ Market entry placed: {order}")
 
@@ -66,7 +66,7 @@ class Engine:
             # ===== 3) TP reduceOnly from average =====
             self._replace_tp(cfg)
 
-            # ===== 4) Monitoring loop =====
+            # ===== 4) Monitoring =====
             self._monitor_loop(cfg)
 
         except Exception as e:
@@ -84,7 +84,7 @@ class Engine:
 
     def _place_grid(self, cfg: DealConfig):
         """
-        Place DCA grid in the defined range. Skip orders that fall below min amount.
+        Place DCA grid in the defined range. Skip orders that fall below min tradable amount.
         """
         last = self._last(cfg)
         n = cfg.limit_orders.orders_count
@@ -102,13 +102,13 @@ class Engine:
             side = "sell"
 
         self.grid_ids.clear()
-        min_amt = self.ex.min_amount(cfg.symbol)
+        min_trade = self.ex.min_tradable_amount(cfg.symbol)
         placed = 0
         for price in levels:
             raw_qty = usdt_per / price
-            qty = self.ex.round_amount(cfg.symbol, raw_qty)
-            if qty <= 0 or qty < min_amt:
-                logger.warning(f"⚠️ Grid skip: qty {qty} < min {min_amt} at price {price}")
+            qty = self.ex.round_amount_down(cfg.symbol, raw_qty)
+            if qty < min_trade:
+                logger.warning(f"⚠️ Grid skip: qty {qty} < min tradable {min_trade} at price {price}")
                 continue
             o = self.ex.place_limit_order(cfg.symbol, side, qty, price, reduce_only=False, post_only=True)
             self.grid_ids.append(o["id"])
@@ -130,7 +130,7 @@ class Engine:
     def _replace_tp(self, cfg: DealConfig):
         """
         Cancel previous TP orders and place new ones from current average price.
-        Skip TP levels whose qty would fall below min amount; allocate remainder to the last TP.
+        Skip TP levels whose qty would fall below min tradable; allocate remainder on the last TP.
         """
         avg, size = self._position_avg_and_size(cfg)
         if avg <= 0 or size <= 0:
@@ -143,7 +143,7 @@ class Engine:
             self.tp_ids.clear()
 
         out_side = exit_side(cfg.side)
-        min_amt = self.ex.min_amount(cfg.symbol)
+        min_trade = self.ex.min_tradable_amount(cfg.symbol)
         remaining = size
         new_ids: List[str] = []
 
@@ -156,17 +156,17 @@ class Engine:
 
             target_qty = size * (tp.quantity_percent / 100.0)
             if i == len(cfg.tp_orders):
-                # put all remainder on the last level
-                target_qty = remaining
+                target_qty = remaining  # put all remainder on the last TP
 
-            qty = self.ex.round_amount(cfg.symbol, target_qty)
-            if qty <= 0 or qty < min_amt:
-                logger.warning(f"⚠️ TP level skipped: qty {qty} < min {min_amt} (price {price})")
+            qty = self.ex.round_amount_down(cfg.symbol, target_qty)
+
+            if qty < min_trade:
+                logger.warning(f"⚠️ TP level skipped: qty {qty} < min tradable {min_trade} (price {price})")
                 continue
             if qty > remaining:
-                qty = self.ex.round_amount(cfg.symbol, remaining)
-                if qty <= 0 or qty < min_amt:
-                    logger.warning(f"⚠️ TP adjusted skip: qty {qty} < min {min_amt} after remaining adjust")
+                qty = self.ex.round_amount_down(cfg.symbol, remaining)
+                if qty < min_trade:
+                    logger.warning(f"⚠️ TP adjusted skip: qty {qty} < min tradable {min_trade} after remaining adjust")
                     continue
 
             o = self.ex.place_limit_order(cfg.symbol, out_side, qty, price, reduce_only=True, post_only=True)
@@ -239,7 +239,6 @@ class Engine:
                     last = self._last(cfg)
 
                     if cfg.side == "long":
-                        # trail SL with new highs
                         if self.best_price is None or last > self.best_price:
                             self.best_price = last
                             self.sl_price = round(self.best_price * (1 - offset), 2)
@@ -248,7 +247,6 @@ class Engine:
                             logger.info(f"🛑 SL hit (long): last={last} <= sl={self.sl_price}")
                             break
                     else:
-                        # trail SL with new lows (for short)
                         if self.best_price is None or last < self.best_price:
                             self.best_price = last
                             self.sl_price = round(self.best_price * (1 + offset), 2)

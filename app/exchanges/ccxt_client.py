@@ -12,7 +12,7 @@ _EX_MAP = {"bybit": "bybit", "gate": "gateio", "gateio": "gateio"}
 class CcxtClient(Exchange):
     """
     CCXT wrapper configured for Bybit/Gate USDT perpetuals.
-    Includes symbol normalization, leverage handling and market helpers.
+    Includes symbol normalization, leverage handling and robust market helpers.
     """
 
     def __init__(self):
@@ -53,7 +53,6 @@ class CcxtClient(Exchange):
             if m.get("type") in ("swap", "future"):
                 return symbol
 
-        # Try common candidates
         candidates = []
         if ":" not in symbol and "/" not in symbol and symbol.endswith("USDT"):
             candidates.append(f"{symbol.replace('USDT', '')}/USDT:USDT")  # BTCUSDT -> BTC/USDT:USDT
@@ -68,12 +67,10 @@ class CcxtClient(Exchange):
                 if m.get("type") in ("swap", "future"):
                     return c
 
-        # If still not found, return as is (will raise in _ensure_linear_swap)
-        return symbol
+        return symbol  # will be validated later
 
     def _ensure_linear_swap(self, symbol: str):
         if symbol not in self.client.markets:
-            # refresh once if needed
             self.client.load_markets()
         if symbol not in self.client.markets:
             raise ValueError(
@@ -113,7 +110,6 @@ class CcxtClient(Exchange):
             return self.client.set_leverage(leverage, symbol, {"category": "linear"})
         except BadRequest as e:
             msg = str(e)
-            # Soft-handle Bybit's "leverage not modified"
             if "110043" in msg or "leverage not modified" in msg.lower():
                 return {"info": {"retCode": 110043, "retMsg": "leverage not modified"}}
             raise
@@ -170,24 +166,46 @@ class CcxtClient(Exchange):
             self.client.load_markets()
         return self.client.market(symbol)
 
-    def round_amount(self, symbol: str, amount: float) -> float:
+    def amount_step(self, symbol: str) -> float:
         """
-        Round amount to market precision/step.
-        CCXT sometimes provides precision as decimals (int) or step (float).
+        Return the minimal increment for amount.
+        - If precision.amount is int => decimals count => step = 10^-decimals
+        - If precision.amount is float => it's already a step
+        - Else fallback to limits.amount.step or limits.amount.min or 1e-6
         """
         m = self.market(symbol)
         prec = (m.get("precision") or {}).get("amount")
         if isinstance(prec, int):
-            return float(f"{amount:.{prec}f}")
+            # decimals -> step
+            return 10 ** (-prec) if prec >= 0 else 1e-6
         if isinstance(prec, float) and prec > 0:
-            step = prec
-            return math.floor(amount / step) * step
+            return prec
 
         step = (m.get("limits", {}).get("amount", {}).get("step")
                 or m.get("limits", {}).get("amount", {}).get("min")
-                or 0.000001)
-        return max(math.floor(amount / step) * step, 0.0)
+                or 1e-6)
+        return float(step)
 
     def min_amount(self, symbol: str) -> float:
+        """
+        Minimal absolute amount according to exchange limits.
+        """
         m = self.market(symbol)
         return float(m.get("limits", {}).get("amount", {}).get("min") or 0.0)
+
+    def min_tradable_amount(self, symbol: str) -> float:
+        """
+        Safe minimal tradable amount = max(step, min_amount).
+        """
+        step = self.amount_step(symbol)
+        min_amt = self.min_amount(symbol)
+        return max(step, min_amt)
+
+    def round_amount_down(self, symbol: str, amount: float) -> float:
+        """
+        Round DOWN to nearest multiple of amount_step.
+        """
+        step = self.amount_step(symbol)
+        if step <= 0:
+            return max(amount, 0.0)
+        return math.floor(amount / step) * step
