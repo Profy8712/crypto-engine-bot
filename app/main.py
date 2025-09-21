@@ -1,5 +1,5 @@
+from .engine import Engine
 from dotenv import load_dotenv
-from app.engine import Engine
 
 def main():
     load_dotenv()
