@@ -2,19 +2,20 @@ import logging
 import os
 from pathlib import Path
 
-# Создаём папку logs если её нет
-Path("logs").mkdir(exist_ok=True)
+# папка логов
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
 
-LOG_FILE = "logs/engine.log"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_FILE = LOG_DIR / "engine.log"
 
-# Настройка логгера
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
+        logging.StreamHandler(),
         logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler()  # дублируем в консоль
-    ]
+    ],
 )
 
-logger = logging.getLogger("crypto-engine")
+logger = logging.getLogger("engine")
