@@ -1,6 +1,7 @@
 import os
+import math
 import ccxt
-from typing import List, Any
+from typing import List, Any, Dict
 from ccxt.base.errors import BadRequest
 from .base import Exchange
 
@@ -10,7 +11,8 @@ _EX_MAP = {"bybit": "bybit", "gate": "gateio", "gateio": "gateio"}
 
 class CcxtClient(Exchange):
     """
-    CCXT-обёртка с нормализацией символа под линейный USDT perpetual на Bybit.
+    CCXT wrapper configured for Bybit/Gate USDT perpetuals.
+    Includes symbol normalization, leverage handling and market helpers.
     """
 
     def __init__(self):
@@ -29,8 +31,8 @@ class CcxtClient(Exchange):
                 "secret": api_secret,
                 "enableRateLimit": True,
                 "options": {
-                    "defaultType": "swap",     # деривативы
-                    "defaultSettle": "USDT",   # линейные USDT контракты
+                    "defaultType": "swap",      # derivatives
+                    "defaultSettle": "USDT",    # linear USDT contracts
                 },
             }
         )
@@ -40,45 +42,55 @@ class CcxtClient(Exchange):
 
         self.client.load_markets()
 
-    # ----------------- helpers -----------------
+    # ----------------- internal helpers -----------------
     def _normalize_symbol(self, symbol: str) -> str:
         """
-        Если пришёл 'BTC/USDT', пытаемся сопоставить 'BTC/USDT:USDT'
-        для линейного свопа. Если уже валидный swap — вернём как есть.
+        Map common inputs like 'BTCUSDT' or 'BTC/USDT' to a linear swap 'BTC/USDT:USDT'.
+        If already a valid swap in markets — return as is.
         """
         if symbol in self.client.markets:
             m = self.client.market(symbol)
             if m.get("type") in ("swap", "future"):
                 return symbol
 
-        candidate = symbol if ":" in symbol else f"{symbol}/USDT:USDT" if "/" not in symbol else f"{symbol}:USDT"
-        if candidate in self.client.markets:
-            return candidate
+        # Try common candidates
+        candidates = []
+        if ":" not in symbol and "/" not in symbol and symbol.endswith("USDT"):
+            candidates.append(f"{symbol.replace('USDT', '')}/USDT:USDT")  # BTCUSDT -> BTC/USDT:USDT
+        if ":" not in symbol and "/" in symbol:
+            candidates.append(f"{symbol}:USDT")                            # BTC/USDT -> BTC/USDT:USDT
+        if ":" not in symbol and "/" not in symbol:
+            candidates.append(f"{symbol}/USDT:USDT")                       # BTC -> BTC/USDT:USDT
 
-        alt = symbol if ":" in symbol else (symbol.replace("USDT", "/USDT:USDT") if "USDT" in symbol and "/" not in symbol else f"{symbol}:USDT")
-        if alt in self.client.markets:
-            return alt
+        for c in candidates:
+            if c in self.client.markets:
+                m = self.client.market(c)
+                if m.get("type") in ("swap", "future"):
+                    return c
 
-        # если ни один не найден — оставим как есть (упадём позже с понятной ошибкой)
+        # If still not found, return as is (will raise in _ensure_linear_swap)
         return symbol
 
     def _ensure_linear_swap(self, symbol: str):
         if symbol not in self.client.markets:
+            # refresh once if needed
+            self.client.load_markets()
+        if symbol not in self.client.markets:
             raise ValueError(
-                f"Символ {symbol} не найден в markets CCXT. "
-                f"Проверь орфографию и формат (например, 'BTC/USDT:USDT')."
+                f"Symbol {symbol} not found in CCXT markets. "
+                f"Use a linear swap like 'BTC/USDT:USDT'."
             )
         m = self.client.market(symbol)
         if m.get("type") != "swap" or not m.get("linear"):
             raise ValueError(
-                f"Символ {symbol} не является линейным USDT perpetual. "
-                f"Для Bybit используй 'BTC/USDT:USDT' и options.defaultType='swap', defaultSettle='USDT'."
+                f"Symbol {symbol} is not a linear USDT perpetual. "
+                f"Use 'BTC/USDT:USDT' with options.defaultType='swap', defaultSettle='USDT'."
             )
 
     def _set_modes_if_supported(self, symbol: str):
         """
-        Для Bybit часто нужно заранее включить isolated и one-way (не hedge).
-        Игнорируем ошибки, если режим уже установлен.
+        For Bybit it's often required to set isolated margin and one-way position mode.
+        Ignore errors if already set or unsupported.
         """
         params = {"category": "linear"}
         try:
@@ -88,11 +100,11 @@ class CcxtClient(Exchange):
             pass
         try:
             if hasattr(self.client, "set_position_mode"):
-                self.client.set_position_mode(False, symbol, params)  # one-way
+                self.client.set_position_mode(False, symbol, params)  # one-way (not hedged)
         except Exception:
             pass
 
-    # ----------------- interface -----------------
+    # ----------------- Exchange interface -----------------
     def set_leverage(self, symbol: str, leverage: int) -> Any:
         symbol = self._normalize_symbol(symbol)
         self._ensure_linear_swap(symbol)
@@ -101,7 +113,7 @@ class CcxtClient(Exchange):
             return self.client.set_leverage(leverage, symbol, {"category": "linear"})
         except BadRequest as e:
             msg = str(e)
-            # мягкая обработка "leverage not modified"
+            # Soft-handle Bybit's "leverage not modified"
             if "110043" in msg or "leverage not modified" in msg.lower():
                 return {"info": {"retCode": 110043, "retMsg": "leverage not modified"}}
             raise
@@ -113,7 +125,7 @@ class CcxtClient(Exchange):
     def place_market_order(self, symbol: str, side: str, qty: float, reduce_only: bool = False) -> Any:
         symbol = self._normalize_symbol(symbol)
         self._ensure_linear_swap(symbol)
-        params = {"reduceOnly": reduce_only} if reduce_only else {}
+        params = {"reduceOnly": True} if reduce_only else {}
         return self.client.create_order(symbol, "market", side, qty, None, params)
 
     def place_limit_order(
@@ -150,3 +162,32 @@ class CcxtClient(Exchange):
         symbol = self._normalize_symbol(symbol)
         positions = self.client.fetch_positions([symbol])
         return [p for p in positions if p.get("symbol") == symbol]
+
+    # ----------------- market helpers -----------------
+    def market(self, symbol: str) -> Dict[str, Any]:
+        symbol = self._normalize_symbol(symbol)
+        if symbol not in self.client.markets:
+            self.client.load_markets()
+        return self.client.market(symbol)
+
+    def round_amount(self, symbol: str, amount: float) -> float:
+        """
+        Round amount to market precision/step.
+        CCXT sometimes provides precision as decimals (int) or step (float).
+        """
+        m = self.market(symbol)
+        prec = (m.get("precision") or {}).get("amount")
+        if isinstance(prec, int):
+            return float(f"{amount:.{prec}f}")
+        if isinstance(prec, float) and prec > 0:
+            step = prec
+            return math.floor(amount / step) * step
+
+        step = (m.get("limits", {}).get("amount", {}).get("step")
+                or m.get("limits", {}).get("amount", {}).get("min")
+                or 0.000001)
+        return max(math.floor(amount / step) * step, 0.0)
+
+    def min_amount(self, symbol: str) -> float:
+        m = self.market(symbol)
+        return float(m.get("limits", {}).get("amount", {}).get("min") or 0.0)
