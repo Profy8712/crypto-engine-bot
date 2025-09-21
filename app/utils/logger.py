@@ -2,7 +2,6 @@ import logging
 import os
 from pathlib import Path
 
-# папка логов
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
 
