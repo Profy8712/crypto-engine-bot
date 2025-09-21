@@ -47,20 +47,30 @@ class Exchange(ABC):
 
     @abstractmethod
     def amount_step(self, symbol: str) -> float:
-        """Return minimal increment (step) for amount, e.g. 0.001."""
+        """Minimal increment (lot step) for amount, e.g. 0.001."""
         ...
 
     @abstractmethod
     def min_amount(self, symbol: str) -> float:
-        """Return minimal allowed amount (exchange limit), e.g. 0.001."""
+        """Exchange minimal allowed amount, e.g. 0.001."""
         ...
 
     @abstractmethod
     def min_tradable_amount(self, symbol: str) -> float:
-        """Return max(step, min_amount) as a safe minimal tradable qty."""
+        """Safe minimal tradable qty = max(step, min_amount)."""
         ...
 
     @abstractmethod
     def round_amount_down(self, symbol: str, amount: float) -> float:
-        """Round amount DOWN to the nearest multiple of amount_step."""
+        """Round amount DOWN to nearest multiple of amount_step."""
+        ...
+
+    @abstractmethod
+    def price_step(self, symbol: str) -> float:
+        """Minimal price tick size."""
+        ...
+
+    @abstractmethod
+    def round_price_to_tick(self, symbol: str, price: float) -> float:
+        """Round price to nearest valid tick (usually down)."""
         ...

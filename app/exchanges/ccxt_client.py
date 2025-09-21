@@ -12,7 +12,7 @@ _EX_MAP = {"bybit": "bybit", "gate": "gateio", "gateio": "gateio"}
 class CcxtClient(Exchange):
     """
     CCXT wrapper configured for Bybit/Gate USDT perpetuals.
-    Includes symbol normalization, leverage handling and robust market helpers.
+    Robust symbol normalization + leverage + precise qty/price rounding.
     """
 
     def __init__(self):
@@ -31,23 +31,17 @@ class CcxtClient(Exchange):
                 "secret": api_secret,
                 "enableRateLimit": True,
                 "options": {
-                    "defaultType": "swap",      # derivatives
-                    "defaultSettle": "USDT",    # linear USDT contracts
+                    "defaultType": "swap",
+                    "defaultSettle": "USDT",
                 },
             }
         )
-
         if hasattr(self.client, "set_sandbox_mode"):
             self.client.set_sandbox_mode(testnet)
-
         self.client.load_markets()
 
-    # ----------------- internal helpers -----------------
+    # ---------- internal helpers ----------
     def _normalize_symbol(self, symbol: str) -> str:
-        """
-        Map common inputs like 'BTCUSDT' or 'BTC/USDT' to a linear swap 'BTC/USDT:USDT'.
-        If already a valid swap in markets — return as is.
-        """
         if symbol in self.client.markets:
             m = self.client.market(symbol)
             if m.get("type") in ("swap", "future"):
@@ -55,40 +49,29 @@ class CcxtClient(Exchange):
 
         candidates = []
         if ":" not in symbol and "/" not in symbol and symbol.endswith("USDT"):
-            candidates.append(f"{symbol.replace('USDT', '')}/USDT:USDT")  # BTCUSDT -> BTC/USDT:USDT
+            candidates.append(f"{symbol.replace('USDT', '')}/USDT:USDT")
         if ":" not in symbol and "/" in symbol:
-            candidates.append(f"{symbol}:USDT")                            # BTC/USDT -> BTC/USDT:USDT
+            candidates.append(f"{symbol}:USDT")
         if ":" not in symbol and "/" not in symbol:
-            candidates.append(f"{symbol}/USDT:USDT")                       # BTC -> BTC/USDT:USDT
+            candidates.append(f"{symbol}/USDT:USDT")
 
         for c in candidates:
             if c in self.client.markets:
                 m = self.client.market(c)
                 if m.get("type") in ("swap", "future"):
                     return c
-
-        return symbol  # will be validated later
+        return symbol
 
     def _ensure_linear_swap(self, symbol: str):
         if symbol not in self.client.markets:
             self.client.load_markets()
         if symbol not in self.client.markets:
-            raise ValueError(
-                f"Symbol {symbol} not found in CCXT markets. "
-                f"Use a linear swap like 'BTC/USDT:USDT'."
-            )
+            raise ValueError(f"Symbol {symbol} not found. Use 'BTC/USDT:USDT'.")
         m = self.client.market(symbol)
         if m.get("type") != "swap" or not m.get("linear"):
-            raise ValueError(
-                f"Symbol {symbol} is not a linear USDT perpetual. "
-                f"Use 'BTC/USDT:USDT' with options.defaultType='swap', defaultSettle='USDT'."
-            )
+            raise ValueError(f"{symbol} is not linear USDT perpetual (expected 'BTC/USDT:USDT').")
 
     def _set_modes_if_supported(self, symbol: str):
-        """
-        For Bybit it's often required to set isolated margin and one-way position mode.
-        Ignore errors if already set or unsupported.
-        """
         params = {"category": "linear"}
         try:
             if hasattr(self.client, "set_margin_mode"):
@@ -97,11 +80,11 @@ class CcxtClient(Exchange):
             pass
         try:
             if hasattr(self.client, "set_position_mode"):
-                self.client.set_position_mode(False, symbol, params)  # one-way (not hedged)
+                self.client.set_position_mode(False, symbol, params)  # one-way
         except Exception:
             pass
 
-    # ----------------- Exchange interface -----------------
+    # ---------- Exchange interface ----------
     def set_leverage(self, symbol: str, leverage: int) -> Any:
         symbol = self._normalize_symbol(symbol)
         self._ensure_linear_swap(symbol)
@@ -138,6 +121,7 @@ class CcxtClient(Exchange):
         params = {"reduceOnly": reduce_only}
         if post_only:
             params["timeInForce"] = "PostOnly"
+        # NB: caller is expected to round qty/price to step/tick already
         return self.client.create_order(symbol, "limit", side, qty, price, params)
 
     def cancel_orders(self, symbol: str, order_ids: List[str]) -> Any:
@@ -159,7 +143,7 @@ class CcxtClient(Exchange):
         positions = self.client.fetch_positions([symbol])
         return [p for p in positions if p.get("symbol") == symbol]
 
-    # ----------------- market helpers -----------------
+    # ---------- market helpers ----------
     def market(self, symbol: str) -> Dict[str, Any]:
         symbol = self._normalize_symbol(symbol)
         if symbol not in self.client.markets:
@@ -167,45 +151,44 @@ class CcxtClient(Exchange):
         return self.client.market(symbol)
 
     def amount_step(self, symbol: str) -> float:
-        """
-        Return the minimal increment for amount.
-        - If precision.amount is int => decimals count => step = 10^-decimals
-        - If precision.amount is float => it's already a step
-        - Else fallback to limits.amount.step or limits.amount.min or 1e-6
-        """
         m = self.market(symbol)
         prec = (m.get("precision") or {}).get("amount")
         if isinstance(prec, int):
-            # decimals -> step
             return 10 ** (-prec) if prec >= 0 else 1e-6
         if isinstance(prec, float) and prec > 0:
             return prec
-
         step = (m.get("limits", {}).get("amount", {}).get("step")
                 or m.get("limits", {}).get("amount", {}).get("min")
                 or 1e-6)
         return float(step)
 
     def min_amount(self, symbol: str) -> float:
-        """
-        Minimal absolute amount according to exchange limits.
-        """
         m = self.market(symbol)
         return float(m.get("limits", {}).get("amount", {}).get("min") or 0.0)
 
     def min_tradable_amount(self, symbol: str) -> float:
-        """
-        Safe minimal tradable amount = max(step, min_amount).
-        """
-        step = self.amount_step(symbol)
-        min_amt = self.min_amount(symbol)
-        return max(step, min_amt)
+        return max(self.amount_step(symbol), self.min_amount(symbol))
 
     def round_amount_down(self, symbol: str, amount: float) -> float:
-        """
-        Round DOWN to nearest multiple of amount_step.
-        """
         step = self.amount_step(symbol)
         if step <= 0:
             return max(amount, 0.0)
         return math.floor(amount / step) * step
+
+    def price_step(self, symbol: str) -> float:
+        m = self.market(symbol)
+        prec = (m.get("precision") or {}).get("price")
+        if isinstance(prec, int):
+            return 10 ** (-prec) if prec >= 0 else 1e-2
+        if isinstance(prec, float) and prec > 0:
+            return prec
+        tick = (m.get("limits", {}).get("price", {}).get("step")
+                or m.get("limits", {}).get("price", {}).get("min")
+                or 0.1)
+        return float(tick)
+
+    def round_price_to_tick(self, symbol: str, price: float) -> float:
+        tick = self.price_step(symbol)
+        if tick <= 0:
+            return price
+        return math.floor(price / tick) * tick
