@@ -1,10 +1,9 @@
 import os
 import math
 import ccxt
-from typing import List, Any, Dict
+from typing import List, Any, Dict, Optional
 from ccxt.base.errors import BadRequest
 from .base import Exchange
-
 
 _EX_MAP = {"bybit": "bybit", "gate": "gateio", "gateio": "gateio"}
 
@@ -31,7 +30,7 @@ class CcxtClient(Exchange):
                 "secret": api_secret,
                 "enableRateLimit": True,
                 "options": {
-                    "defaultType": "swap",
+                    "defaultType": "swap",   # USDT Perpetual
                     "defaultSettle": "USDT",
                 },
             }
@@ -40,18 +39,30 @@ class CcxtClient(Exchange):
             self.client.set_sandbox_mode(testnet)
         self.client.load_markets()
 
+        # Cache to avoid re-loading
+        self._market_cache: Dict[str, Dict[str, Any]] = {}
+
     # ---------- internal helpers ----------
+
     def _normalize_symbol(self, symbol: str) -> str:
+        """
+        Ensure symbol matches exchange market id for USDT linear swap.
+        Accepts: 'BTCUSDT', 'BTC/USDT', 'BTC/USDT:USDT', etc.
+        """
         if symbol in self.client.markets:
             m = self.client.market(symbol)
             if m.get("type") in ("swap", "future"):
                 return symbol
 
         candidates = []
+        # raw 'BTCUSDT'
         if ":" not in symbol and "/" not in symbol and symbol.endswith("USDT"):
             candidates.append(f"{symbol.replace('USDT', '')}/USDT:USDT")
+            candidates.append(f"{symbol}/USDT:USDT")  # fallback if someone passed base only
+        # 'BTC/USDT'
         if ":" not in symbol and "/" in symbol:
             candidates.append(f"{symbol}:USDT")
+        # generic fallback
         if ":" not in symbol and "/" not in symbol:
             candidates.append(f"{symbol}/USDT:USDT")
 
@@ -63,13 +74,9 @@ class CcxtClient(Exchange):
         return symbol
 
     def _ensure_linear_swap(self, symbol: str):
-        if symbol not in self.client.markets:
-            self.client.load_markets()
-        if symbol not in self.client.markets:
-            raise ValueError(f"Symbol {symbol} not found. Use 'BTC/USDT:USDT'.")
-        m = self.client.market(symbol)
-        if m.get("type") != "swap" or not m.get("linear"):
-            raise ValueError(f"{symbol} is not linear USDT perpetual (expected 'BTC/USDT:USDT').")
+        mk = self.market(symbol)
+        if mk.get("type") != "swap" or not mk.get("linear"):
+            raise ValueError(f"{symbol} is not linear USDT perpetual (expected like 'BTC/USDT:USDT').")
 
     def _set_modes_if_supported(self, symbol: str):
         params = {"category": "linear"}
@@ -85,6 +92,7 @@ class CcxtClient(Exchange):
             pass
 
     # ---------- Exchange interface ----------
+
     def set_leverage(self, symbol: str, leverage: int) -> Any:
         symbol = self._normalize_symbol(symbol)
         self._ensure_linear_swap(symbol)
@@ -93,6 +101,7 @@ class CcxtClient(Exchange):
             return self.client.set_leverage(leverage, symbol, {"category": "linear"})
         except BadRequest as e:
             msg = str(e)
+            # Bybit often returns "leverage not modified" – not an error for us
             if "110043" in msg or "leverage not modified" in msg.lower():
                 return {"info": {"retCode": 110043, "retMsg": "leverage not modified"}}
             raise
@@ -102,9 +111,15 @@ class CcxtClient(Exchange):
         return float(self.client.fetch_ticker(symbol)["last"])
 
     def place_market_order(self, symbol: str, side: str, qty: float, reduce_only: bool = False) -> Any:
+        """
+        Create market order. Always passes {"category":"linear"} for Bybit v5.
+        """
         symbol = self._normalize_symbol(symbol)
         self._ensure_linear_swap(symbol)
-        params = {"reduceOnly": True} if reduce_only else {}
+        params = {"category": "linear"}
+        if reduce_only:
+            params["reduceOnly"] = True
+        # Ensure no price is sent for market orders
         return self.client.create_order(symbol, "market", side, qty, None, params)
 
     def place_limit_order(
@@ -116,12 +131,17 @@ class CcxtClient(Exchange):
         reduce_only: bool = False,
         post_only: bool = True,
     ) -> Any:
+        """
+        Create limit order. Caller must round qty/price prior to call.
+        """
         symbol = self._normalize_symbol(symbol)
         self._ensure_linear_swap(symbol)
-        params = {"reduceOnly": reduce_only}
+        params: Dict[str, Any] = {"category": "linear"}
+        if reduce_only:
+            params["reduceOnly"] = True
         if post_only:
+            # Bybit uses "PostOnly" in timeInForce
             params["timeInForce"] = "PostOnly"
-        # NB: caller is expected to round qty/price to step/tick already
         return self.client.create_order(symbol, "limit", side, qty, price, params)
 
     def cancel_orders(self, symbol: str, order_ids: List[str]) -> Any:
@@ -129,34 +149,41 @@ class CcxtClient(Exchange):
         out = []
         for oid in order_ids:
             try:
-                out.append(self.client.cancel_order(oid, symbol))
+                out.append(self.client.cancel_order(oid, symbol, {"category": "linear"}))
             except Exception:
                 pass
         return out
 
     def fetch_open_orders(self, symbol: str) -> Any:
         symbol = self._normalize_symbol(symbol)
-        return self.client.fetch_open_orders(symbol)
+        return self.client.fetch_open_orders(symbol, params={"category": "linear"})
 
     def fetch_positions(self, symbol: str) -> Any:
         symbol = self._normalize_symbol(symbol)
-        positions = self.client.fetch_positions([symbol])
+        positions = self.client.fetch_positions([symbol], params={"category": "linear"})
         return [p for p in positions if p.get("symbol") == symbol]
 
     # ---------- market helpers ----------
+
     def market(self, symbol: str) -> Dict[str, Any]:
         symbol = self._normalize_symbol(symbol)
+        if symbol in self._market_cache:
+            return self._market_cache[symbol]
         if symbol not in self.client.markets:
             self.client.load_markets()
-        return self.client.market(symbol)
+        mk = self.client.market(symbol)
+        self._market_cache[symbol] = mk
+        return mk
 
     def amount_step(self, symbol: str) -> float:
         m = self.market(symbol)
+        # preferred from precision
         prec = (m.get("precision") or {}).get("amount")
         if isinstance(prec, int):
             return 10 ** (-prec) if prec >= 0 else 1e-6
         if isinstance(prec, float) and prec > 0:
-            return prec
+            return float(prec)
+        # fallback from limits
         step = (m.get("limits", {}).get("amount", {}).get("step")
                 or m.get("limits", {}).get("amount", {}).get("min")
                 or 1e-6)
@@ -181,7 +208,7 @@ class CcxtClient(Exchange):
         if isinstance(prec, int):
             return 10 ** (-prec) if prec >= 0 else 1e-2
         if isinstance(prec, float) and prec > 0:
-            return prec
+            return float(prec)
         tick = (m.get("limits", {}).get("price", {}).get("step")
                 or m.get("limits", {}).get("price", {}).get("min")
                 or 0.1)
@@ -191,4 +218,17 @@ class CcxtClient(Exchange):
         tick = self.price_step(symbol)
         if tick <= 0:
             return price
+        # floor to tick
         return math.floor(price / tick) * tick
+
+    # Optional: within price limits helper
+    def clamp_price_to_limits(self, symbol: str, price: float) -> float:
+        m = self.market(symbol)
+        lims = (m.get("limits") or {}).get("price") or {}
+        pmin: Optional[float] = lims.get("min")
+        pmax: Optional[float] = lims.get("max")
+        if pmin is not None and price < pmin:
+            price = pmin
+        if pmax is not None and price > pmax:
+            price = pmax
+        return price

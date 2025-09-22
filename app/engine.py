@@ -52,9 +52,14 @@ class Engine:
             min_trade = self.ex.min_tradable_amount(cfg.symbol)
             qty = self.ex.round_amount_down(cfg.symbol, raw_qty)
 
-            logger.info(f"➡️ Entry calc: last={last}, raw_qty={raw_qty}, step={step}, min_tradable={min_trade}, qty_rounded={qty}")
+            logger.info(
+                f"➡️ Entry calc: last={last}, raw_qty={raw_qty}, step={step}, "
+                f"min_tradable={min_trade}, qty_rounded={qty}"
+            )
             if qty < min_trade:
                 raise ValueError(f"Calculated market qty {qty} < min tradable {min_trade}")
+
+            # Market order (with category=linear on client)
             order = self.ex.place_market_order(cfg.symbol, entry_side, qty, reduce_only=False)
             logger.info(f"✅ Market entry placed: {order}")
 
@@ -90,41 +95,63 @@ class Engine:
         skip gracefully and return None.
         """
         try:
+            # round & clamp price defensively
+            price = self.ex.round_price_to_tick(symbol, price)
+            price = self.ex.clamp_price_to_limits(symbol, price)
             return self.ex.place_limit_order(symbol, side, qty, price, reduce_only=reduce_only, post_only=post_only)
         except InvalidOrder as e:
             msg = str(e)
             if "110017" in msg or "truncated to zero" in msg.lower():
-                logger.warning(f"⚠️ Skipped limit order by exchange filter (110017): side={side}, qty={qty}, price={price}")
+                logger.warning(
+                    f"⚠️ Skipped limit order by exchange filter (110017): side={side}, qty={qty}, price={price}"
+                )
                 return None
             raise
 
     def _place_grid(self, cfg: DealConfig):
+        """
+        Place averaging (DCA) grid across a percent range from current price.
+        """
         last = self._last(cfg)
         n = cfg.limit_orders.orders_count
+        if n <= 0:
+            logger.info("⏭ Grid disabled: orders_count=0")
+            return
+
         usdt_total = cfg.limit_orders_amount
         usdt_per = usdt_total / max(n, 1)
         r = cfg.limit_orders.range_percent / 100.0
 
         if cfg.side == "long":
+            # grid below last
             raw_levels = [last * (1 - r * i / n) for i in range(1, n + 1)]
             side = "buy"
         else:
+            # grid above last
             raw_levels = [last * (1 + r * i / n) for i in range(1, n + 1)]
             side = "sell"
-
-        levels = [self.ex.round_price_to_tick(cfg.symbol, p) for p in raw_levels]
 
         self.grid_ids.clear()
         min_trade = self.ex.min_tradable_amount(cfg.symbol)
         step = self.ex.amount_step(cfg.symbol)
         placed = 0
-        for price in levels:
+
+        for raw_price in raw_levels:
+            price = self.ex.round_price_to_tick(cfg.symbol, raw_price)
+            price = self.ex.clamp_price_to_limits(cfg.symbol, price)
+
             raw_qty = usdt_per / price
             qty = self.ex.round_amount_down(cfg.symbol, raw_qty)
-            logger.info(f"🧩 Grid level: price_raw={raw_qty*price:.8f}@{price}, qty_raw={raw_qty}, step={step}, min_tradable={min_trade}, qty_rounded={qty}")
+
+            logger.info(
+                f"🧩 Grid level: price_raw={raw_price}, price={price}, "
+                f"qty_raw={raw_qty}, step={step}, min_tradable={min_trade}, qty_rounded={qty}"
+            )
+
             if qty < min_trade:
                 logger.warning(f"⚠️ Grid skip: qty {qty} < min tradable {min_trade} @ {price}")
                 continue
+
             o = self._safe_limit_order(cfg.symbol, side, qty, price, reduce_only=False, post_only=True)
             if o:
                 self.grid_ids.append(o["id"])
@@ -141,6 +168,9 @@ class Engine:
         return 0.0, 0.0
 
     def _replace_tp(self, cfg: DealConfig):
+        """
+        Replace TP orders based on current average price.
+        """
         avg, size = self._position_avg_and_size(cfg)
         if avg <= 0 or size <= 0:
             logger.info("⏭ No active position — skip TP placement")
@@ -158,18 +188,21 @@ class Engine:
         new_ids: List[str] = []
 
         for i, tp in enumerate(cfg.tp_orders, start=1):
-            # price from avg (rounded to tick)
+            # price from avg (then round/clamp)
             raw_price = avg * (1 + tp.price_percent / 100.0) if cfg.side == "long" \
                         else avg * (1 - tp.price_percent / 100.0)
             price = self.ex.round_price_to_tick(cfg.symbol, raw_price)
+            price = self.ex.clamp_price_to_limits(cfg.symbol, price)
 
             target_qty = size * (tp.quantity_percent / 100.0)
             if i == len(cfg.tp_orders):
                 target_qty = remaining
 
             qty = self.ex.round_amount_down(cfg.symbol, target_qty)
-            logger.info(f"🎯 TP level {i}: price_raw={raw_price}, price={price}, "
-                        f"target_qty={target_qty}, step={step}, min_tradable={min_trade}, qty_rounded={qty}")
+            logger.info(
+                f"🎯 TP level {i}: price_raw={raw_price}, price={price}, "
+                f"target_qty={target_qty}, step={step}, min_tradable={min_trade}, qty_rounded={qty}"
+            )
 
             if qty < min_trade:
                 logger.warning(f"⚠️ TP skip: qty {qty} < min tradable {min_trade} @ {price}")
@@ -194,11 +227,11 @@ class Engine:
         if avg <= 0 or size <= 0:
             return
         if cfg.side == "long":
-            self.sl_price = self.ex.round_price_to_tick(cfg.symbol, avg * (1 - cfg.stop_loss_percent / 100.0))
-            self.best_price = avg
+            sl_raw = avg * (1 - cfg.stop_loss_percent / 100.0)
         else:
-            self.sl_price = self.ex.round_price_to_tick(cfg.symbol, avg * (1 + cfg.stop_loss_percent / 100.0))
-            self.best_price = avg
+            sl_raw = avg * (1 + cfg.stop_loss_percent / 100.0)
+        self.sl_price = self.ex.clamp_price_to_limits(cfg.symbol, self.ex.round_price_to_tick(cfg.symbol, sl_raw))
+        self.best_price = avg
         self.sl_active = True
         logger.info(f"🛡️  SL initialized at {self.sl_price}, trailing base={self.best_price}")
 
@@ -209,6 +242,7 @@ class Engine:
         if any(oid not in open_ids for oid in self.tp_ids):
             self.first_tp_done = True
             self.sl_price = self.ex.round_price_to_tick(cfg.symbol, avg)
+            self.sl_price = self.ex.clamp_price_to_limits(cfg.symbol, self.sl_price)
             logger.info(f"🔁 Move SL to breakeven: sl={self.sl_price}")
 
     def _close_market_reduce_only(self, cfg: DealConfig, size: float):
@@ -225,6 +259,7 @@ class Engine:
         while True:
             try:
                 open_ids_now = {o["id"] for o in self.ex.fetch_open_orders(cfg.symbol)}
+                # if any grid order got filled, re-place TP from new average
                 if any(oid not in open_ids_now for oid in self.grid_ids):
                     self._replace_tp(cfg)
 
@@ -236,7 +271,10 @@ class Engine:
                     if cfg.side == "long":
                         if self.best_price is None or last > self.best_price:
                             self.best_price = last
-                            self.sl_price = self.ex.round_price_to_tick(cfg.symbol, self.best_price * (1 - offset))
+                            sl = self.best_price * (1 - offset)
+                            self.sl_price = self.ex.clamp_price_to_limits(
+                                cfg.symbol, self.ex.round_price_to_tick(cfg.symbol, sl)
+                            )
                         if self.sl_price is not None and last <= self.sl_price:
                             self._close_market_reduce_only(cfg, size)
                             logger.info(f"🛑 SL hit (long): last={last} <= sl={self.sl_price}")
@@ -244,12 +282,16 @@ class Engine:
                     else:
                         if self.best_price is None or last < self.best_price:
                             self.best_price = last
-                            self.sl_price = self.ex.round_price_to_tick(cfg.symbol, self.best_price * (1 + offset))
+                            sl = self.best_price * (1 + offset)
+                            self.sl_price = self.ex.clamp_price_to_limits(
+                                cfg.symbol, self.ex.round_price_to_tick(cfg.symbol, sl)
+                            )
                         if self.sl_price is not None and last >= self.sl_price:
                             self._close_market_reduce_only(cfg, size)
                             logger.info(f"🛑 SL hit (short): last={last} >= sl={self.sl_price}")
                             break
 
+                # lifetime guard for the deal
                 if time.time() > deadline:
                     still_open = [oid for oid in self.grid_ids if oid in open_ids_now]
                     if still_open:
