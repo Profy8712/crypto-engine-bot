@@ -1,0 +1,106 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Crypto Engine Monitor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{margin:0;font-family:system-ui,Arial}
+    header{padding:10px 14px;border-bottom:1px solid #eee;display:flex;gap:12px;align-items:center}
+    #status{font-size:14px;opacity:.8}
+    #chart{height:70vh;}
+    #events{padding:10px 14px;max-height:25vh;overflow:auto;font-size:13px}
+    .pill{padding:2px 8px;border-radius:999px;border:1px solid #ddd}
+    .tp{background:#e8fff3} .sl{background:#ffecec} .grid{background:#eef6ff} .entry{background:#f5f0ff} .be{background:#fff7e6}
+  </style>
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+<header>
+  <strong>Crypto Engine Monitor</strong>
+  <span id="status">connecting…</span>
+  <span class="pill" id="symbol"></span>
+</header>
+<div id="chart"></div>
+<pre id="events"></pre>
+
+<script>
+const qs = new URLSearchParams(location.search);
+const SYMBOL = qs.get("symbol") || "BTC/USDT:USDT";
+
+document.getElementById('symbol').textContent = SYMBOL;
+
+const chart = LightweightCharts.createChart(document.getElementById('chart'), {
+  layout: { textColor: '#333', background: { type: 'solid', color: '#fff' } },
+  rightPriceScale: { borderVisible: false },
+  timeScale: { borderVisible: false, timeVisible: true, secondsVisible: true }
+});
+const candleSeries = chart.addCandlestickSeries();
+const markers = [];
+
+function addMarker(time, position, color, text) {
+  markers.push({ time, position, color, shape: 'circle', text });
+  candleSeries.setMarkers(markers);
+}
+
+function tsToSec(ts) {
+  // timestamp may be ms or sec
+  return ts > 2e10 ? Math.floor(ts/1000) : ts;
+}
+
+async function loadHistory() {
+  // 1) Загрузим последние свечи через /ticker нет — тогда рисуем «спарк» из событий
+  // Пока просто грузим события и ставим маркеры + синтетические свечи
+  const res = await fetch('/events?limit=500');
+  const data = await res.json();
+  const events = data.filter(e => e.symbol === SYMBOL).reverse();
+
+  // Синтетические свечи из цен событий (fallback если нет OHLC)
+  const ohlc = [];
+  for (let i=0; i<events.length; i++) {
+    const t = tsToSec(Date.parse(events[i].ts || events[i].timestamp || new Date())/1000 || events[i].ts || Date.now());
+    const p = events[i].price || 0;
+    if (!p) continue;
+    ohlc.push({ time: t, open: p, high: p, low: p, close: p });
+  }
+  if (ohlc.length) candleSeries.setData(ohlc);
+
+  for (const ev of events) placeMarker(ev);
+}
+
+function placeMarker(ev) {
+  const time = tsToSec(Math.floor(new Date(ev.ts).getTime()/1000) || (ev.ts||Date.now())/1000);
+  const t = ev.type;
+  const price = ev.price;
+  if (!price) return;
+  let color = '#6c5ce7', label = 'ENTRY';
+  if (t==='tp') { color='#00b894'; label='TP'; }
+  else if (t==='sl') { color='#d63031'; label='SL'; }
+  else if (t==='grid') { color='#0984e3'; label='GRID'; }
+  else if (t==='sl_move_be') { color='#f39c12'; label='BE'; }
+  addMarker(time, 'aboveBar', color, `${label} ${price}`);
+  // log line
+  const pre = document.getElementById('events');
+  pre.textContent = `${new Date(ev.ts).toLocaleString()}  ${t.toUpperCase()}  ${ev.side||''}  ${ev.price||''}  ${ev.qty||''}\n` + pre.textContent;
+}
+
+async function bootWS() {
+  const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${wsProto}://${location.host}/ws/stream`);
+  const st = document.getElementById('status');
+  ws.onopen = () => st.textContent = 'connected';
+  ws.onclose = () => st.textContent = 'disconnected';
+  ws.onerror = () => st.textContent = 'error';
+  ws.onmessage = (m) => {
+    try {
+      const ev = JSON.parse(m.data);
+      if (ev.symbol !== SYMBOL) return;
+      placeMarker(ev);
+    } catch(e) {}
+  };
+}
+
+loadHistory().then(bootWS);
+</script>
+</body>
+</html>

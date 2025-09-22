@@ -1,3 +1,14 @@
+from app.db import add_event, TradeEvent
+from app.event_bus import bus
+import asyncio
+
+def emit_event(ev: dict):
+    add_event(TradeEvent(**ev))
+    try:
+        asyncio.create_task(bus.publish("events", ev))
+    except RuntimeError:
+        pass
+
 import json
 import time
 from pathlib import Path
@@ -63,6 +74,13 @@ class Engine:
             order = self.ex.place_market_order(cfg.symbol, entry_side, qty, reduce_only=False)
             logger.info(f"✅ Market entry placed: {order}")
 
+emit_event({
+    "type": "entry",
+    "symbol": cfg.symbol,
+    "side": cfg.side,
+    "price": last,
+    "qty": qty,
+})
             # init SL/trailing
             self._init_sl_trailing(cfg)
 
@@ -157,6 +175,13 @@ class Engine:
                 self.grid_ids.append(o["id"])
                 placed += 1
 
+        emit_event({
+            "type": "grid",
+            "symbol": cfg.symbol,
+            "side": side,
+            "price": price,
+            "qty": qty,
+        })
         logger.info(f"🧱 Placed grid orders: {placed}")
 
     def _position_avg_and_size(self, cfg: DealConfig) -> Tuple[float, float]:
@@ -219,6 +244,13 @@ class Engine:
                 new_ids.append(o["id"])
                 remaining = max(0.0, remaining - qty)
 
+        emit_event({
+            "type": "tp",
+            "symbol": cfg.symbol,
+            "side": out_side,
+            "price": price,
+            "qty": qty,
+        })
         self.tp_ids = new_ids
         logger.info(f"🎯 Replaced TP orders: {len(self.tp_ids)} (remaining not allocated: {remaining})")
 
@@ -245,6 +277,11 @@ class Engine:
             self.sl_price = self.ex.clamp_price_to_limits(cfg.symbol, self.sl_price)
             logger.info(f"🔁 Move SL to breakeven: sl={self.sl_price}")
 
+    emit_event({
+        "type": "sl_move_be",
+        "symbol": cfg.symbol,
+        "price": avg,
+    })
     def _close_market_reduce_only(self, cfg: DealConfig, size: float):
         side = exit_side(cfg.side)
         try:
@@ -278,6 +315,13 @@ class Engine:
                         if self.sl_price is not None and last <= self.sl_price:
                             self._close_market_reduce_only(cfg, size)
                             logger.info(f"🛑 SL hit (long): last={last} <= sl={self.sl_price}")
+                            emit_event({
+                                "type": "sl",
+                                "symbol": cfg.symbol,
+                                "side": exit_side(cfg.side),
+                                "price": last,
+                                "qty": size,
+                            })
                             break
                     else:
                         if self.best_price is None or last < self.best_price:
@@ -289,6 +333,13 @@ class Engine:
                         if self.sl_price is not None and last >= self.sl_price:
                             self._close_market_reduce_only(cfg, size)
                             logger.info(f"🛑 SL hit (short): last={last} >= sl={self.sl_price}")
+                            emit_event({
+                                "type": "sl",
+                                "symbol": cfg.symbol,
+                                "side": exit_side(cfg.side),
+                                "price": last,
+                                "qty": size,
+                            })
                             break
 
                 # lifetime guard for the deal
