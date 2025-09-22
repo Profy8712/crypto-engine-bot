@@ -7,6 +7,7 @@ def emit_event(ev: dict):
     try:
         asyncio.create_task(bus.publish("events", ev))
     except RuntimeError:
+        # no running loop (e.g. sync context) — just skip async publish
         pass
 
 import json
@@ -74,13 +75,15 @@ class Engine:
             order = self.ex.place_market_order(cfg.symbol, entry_side, qty, reduce_only=False)
             logger.info(f"✅ Market entry placed: {order}")
 
-emit_event({
-    "type": "entry",
-    "symbol": cfg.symbol,
-    "side": cfg.side,
-    "price": last,
-    "qty": qty,
-})
+            # emit entry event
+            emit_event({
+                "type": "entry",
+                "symbol": cfg.symbol,
+                "side": cfg.side,
+                "price": last,
+                "qty": qty,
+            })
+
             # init SL/trailing
             self._init_sl_trailing(cfg)
 
@@ -175,13 +178,15 @@ emit_event({
                 self.grid_ids.append(o["id"])
                 placed += 1
 
-        emit_event({
-            "type": "grid",
-            "symbol": cfg.symbol,
-            "side": side,
-            "price": price,
-            "qty": qty,
-        })
+                # emit grid order event (per each successfully placed order)
+                emit_event({
+                    "type": "grid",
+                    "symbol": cfg.symbol,
+                    "side": side,
+                    "price": price,
+                    "qty": qty,
+                })
+
         logger.info(f"🧱 Placed grid orders: {placed}")
 
     def _position_avg_and_size(self, cfg: DealConfig) -> Tuple[float, float]:
@@ -244,13 +249,15 @@ emit_event({
                 new_ids.append(o["id"])
                 remaining = max(0.0, remaining - qty)
 
-        emit_event({
-            "type": "tp",
-            "symbol": cfg.symbol,
-            "side": out_side,
-            "price": price,
-            "qty": qty,
-        })
+                # emit TP placement event (per each TP leg)
+                emit_event({
+                    "type": "tp",
+                    "symbol": cfg.symbol,
+                    "side": out_side,
+                    "price": price,
+                    "qty": qty,
+                })
+
         self.tp_ids = new_ids
         logger.info(f"🎯 Replaced TP orders: {len(self.tp_ids)} (remaining not allocated: {remaining})")
 
@@ -277,11 +284,13 @@ emit_event({
             self.sl_price = self.ex.clamp_price_to_limits(cfg.symbol, self.sl_price)
             logger.info(f"🔁 Move SL to breakeven: sl={self.sl_price}")
 
-    emit_event({
-        "type": "sl_move_be",
-        "symbol": cfg.symbol,
-        "price": avg,
-    })
+            # emit BE move event (first TP filled -> SL moved to avg price)
+            emit_event({
+                "type": "sl_move_be",
+                "symbol": cfg.symbol,
+                "price": avg,
+            })
+
     def _close_market_reduce_only(self, cfg: DealConfig, size: float):
         side = exit_side(cfg.side)
         try:
@@ -315,6 +324,8 @@ emit_event({
                         if self.sl_price is not None and last <= self.sl_price:
                             self._close_market_reduce_only(cfg, size)
                             logger.info(f"🛑 SL hit (long): last={last} <= sl={self.sl_price}")
+
+                            # emit SL event
                             emit_event({
                                 "type": "sl",
                                 "symbol": cfg.symbol,
@@ -333,6 +344,8 @@ emit_event({
                         if self.sl_price is not None and last >= self.sl_price:
                             self._close_market_reduce_only(cfg, size)
                             logger.info(f"🛑 SL hit (short): last={last} >= sl={self.sl_price}")
+
+                            # emit SL event
                             emit_event({
                                 "type": "sl",
                                 "symbol": cfg.symbol,
