@@ -1,7 +1,8 @@
 # Crypto Engine Bot
 
 Trading engine for **Bybit Testnet** written in Python.  
-It connects to Bybit via [ccxt](https://github.com/ccxt/ccxt), opens trades from a JSON config, supports **DCA averaging**, **dynamic take-profits (TP)** and basic **SL/trailing SL** logic.
+It connects to Bybit via [ccxt](https://github.com/ccxt/ccxt), opens trades from a JSON config, supports **DCA averaging**, **dynamic take-profits (TP)** and basic **SL/trailing SL** logic.  
+Also includes **FastAPI monitoring API** and **Web UI with charts and events**.
 
 ---
 
@@ -13,14 +14,13 @@ It connects to Bybit via [ccxt](https://github.com/ccxt/ccxt), opens trades from
 - Dynamic TP recalculation when average price changes  
 - Stop Loss (SL) and Trailing SL  
 - Move SL to breakeven after first TP  
-- Monitoring of positions and orders  
-- ✅ Test scripts included (`test_connection.py`, `test_order.py`, `close_position.py`)  
+- Monitoring of positions and orders via REST API  
+- ✅ Web UI with charts, markers (ENTRY, GRID, TP, SL, BE) and tables  
 
-### Bonus (optional)
+### Bonus
 - Dockerfile for containerized run  
 - Logging to both console and `logs/engine.log`  
-- REST API with FastAPI for monitoring  
-- UI monitoring (future idea, with charts marking entry/exit)  
+- Event storage in SQLite (`logs/events.db`)  
 
 ---
 
@@ -28,26 +28,27 @@ It connects to Bybit via [ccxt](https://github.com/ccxt/ccxt), opens trades from
 ```
 crypto-engine-bot/
 ├── app/
-│   ├── __init__.py
-│   ├── main.py            # entrypoint
-│   ├── engine.py          # engine logic
-│   ├── models.py          # config schema
-│   ├── api.py             # REST API (FastAPI)
-│   ├── utils/
-│   │   └── logger.py      # logger setup
-│   └── exchanges/
-│       ├── __init__.py
-│       ├── base.py        # abstract base class
-│       └── ccxt_client.py # ccxt wrapper
-├── config.example.json     # example trade config
-├── .env.example            # example environment file
-├── test_connection.py      # check API & last price
-├── test_order.py           # place & cancel order
-├── close_position.py       # close open position
+│   ├── engine.py           # core trading engine
+│   ├── api.py              # REST API (FastAPI + Web UI)
+│   ├── db.py               # SQLite events storage
+│   ├── event_bus.py        # async pub/sub bus for events
+│   ├── models.py           # deal config schema
+│   ├── exchanges/
+│   │   └── ccxt_client.py  # ccxt wrapper
+│   └── utils/logger.py     # logger setup
+├── scripts/
+│   ├── run_deal.py         # run engine with deal config
+│   ├── fake_events.py      # generate fake events for UI demo
+│   └── patch_engine_events.py # auto-insert emit_event calls
+├── static/monitor.html     # Web UI monitoring page
+├── config.example.json      # example trade config
+├── .env.example             # example environment file
+├── test_connection.py       # check API & last price
+├── test_order.py            # place & cancel order
+├── close_position.py        # close open position
 ├── requirements.txt
-├── Dockerfile              # (bonus)
-├── README.md
-└── logs/                   # engine logs
+├── Dockerfile
+└── logs/                    # engine logs + events.db
 ```
 
 ---
@@ -62,7 +63,6 @@ API_KEY=your_api_key
 API_SECRET=your_api_secret
 TESTNET=true
 SYMBOL=BTC/USDT:USDT
-TEST_QTY=0.001
 LOG_LEVEL=INFO
 ```
 
@@ -125,21 +125,24 @@ python test_order.py
 
 ### 4. Run engine with config
 ```bash
-python -m app.main
+python scripts/run_deal.py config.example.json
 ```
 
-### 5. Close position
+### 5. Generate fake events (for UI demo)
+```bash
+python scripts/fake_events.py
+```
+
+### 6. Close position
 ```bash
 python close_position.py
 ```
 
 ---
 
-## 🌐 REST API (monitoring)
+## 🌐 REST API + Web UI
 
-You can also run the FastAPI server to monitor positions/orders:
-
-### Run API
+Run API:
 ```bash
 uvicorn app.api:app --reload --host 0.0.0.0 --port 8000
 ```
@@ -148,29 +151,19 @@ uvicorn app.api:app --reload --host 0.0.0.0 --port 8000
 - `GET /ping` → health check (`{"status": "ok"}`)  
 - `GET /status?symbol=BTC/USDT:USDT` → current positions and open orders  
 - `GET /ticker?symbol=BTC/USDT:USDT` → last market price  
+- `GET /events?symbol=BTC/USDT:USDT` → recent trade events  
+- `GET /ohlcv?symbol=BTC/USDT:USDT&timeframe=1m` → OHLCV candles  
+
+### Web UI
+Open in browser:  
+```
+http://127.0.0.1:8000/monitor?symbol=BTC/USDT:USDT
+```
 
 ### Swagger UI
 Open in browser:  
 ```
 http://127.0.0.1:8000/docs
-```
-
----
-
-## 🐳 Docker (bonus)
-Build:
-```bash
-docker build -t crypto-engine-bot .
-```
-
-Run:
-```bash
-docker run --env-file .env -p 8000:8000 crypto-engine-bot
-```
-
-Check logs:
-```bash
-docker logs -f crypto-engine
 ```
 
 ---
@@ -183,7 +176,22 @@ docker logs -f crypto-engine
 5. `05_sl_trailing.png` → SL to breakeven or SL hit logs  
 6. `06_config_file.png` → config.example.json in editor  
 7. `07_docker_ps.png` → `docker ps` with running container  
+8. `08_ui_monitoring.png` → Web UI monitoring with chart, markers and orders table  
 
+![UI Monitoring Demo](docs/08_ui_monitoring.png)
+
+---
+
+## 🐳 Docker (optional)
+Build:
+```bash
+docker build -t crypto-engine-bot .
+```
+
+Run:
+```bash
+docker run --env-file .env -p 8000:8000 crypto-engine-bot
+```
 
 ---
 
