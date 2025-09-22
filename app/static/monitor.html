@@ -5,102 +5,251 @@
   <title>Crypto Engine Monitor</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
     body{margin:0;font-family:system-ui,Arial}
-    header{padding:10px 14px;border-bottom:1px solid #eee;display:flex;gap:12px;align-items:center}
+    header{padding:10px 14px;border-bottom:1px solid #eee;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
     #status{font-size:14px;opacity:.8}
-    #chart{height:70vh;}
-    #events{padding:10px 14px;max-height:25vh;overflow:auto;font-size:13px}
     .pill{padding:2px 8px;border-radius:999px;border:1px solid #ddd}
-    .tp{background:#e8fff3} .sl{background:#ffecec} .grid{background:#eef6ff} .entry{background:#f5f0ff} .be{background:#fff7e6}
+    .row{display:flex;gap:10px;align-items:center}
+    select,button{padding:6px 10px;border-radius:10px;border:1px solid #ddd;background:#fff;cursor:pointer}
+    main{display:grid;grid-template-columns: minmax(600px, 1fr) 380px; gap:0; height: calc(100vh - 58px);}
+    #chartWrap{border-right:1px solid #eee; display:flex; flex-direction:column}
+    #chart{flex:1; min-height: 60vh;}
+    #events{padding:10px 14px;max-height:28vh;overflow:auto;font-size:12px;background:#fafafa;border-top:1px solid #eee}
+    aside{display:flex;flex-direction:column; min-height:0;}
+    .panel{padding:12px 14px;border-bottom:1px solid #eee; overflow:auto}
+    .panel h3{margin:0 0 8px 0; font-size:16px}
+    table{border-collapse:collapse;width:100%;font-size:13px}
+    th,td{border-bottom:1px solid #eee;padding:6px 4px;text-align:left}
+    .legend{display:flex;gap:8px;flex-wrap:wrap; font-size:12px}
+    .dot{width:10px;height:10px;border-radius:50%}
+    .dot.entry{background:#6c5ce7}
+    .dot.grid{background:#0984e3}
+    .dot.tp{background:#0aa63a}
+    .dot.sl{background:#d63031}
+    .dot.be{background:#f39c12}
+    @media (max-width: 1100px){
+      main{grid-template-columns: 1fr;}
+      #chartWrap{border-right:none}
+    }
   </style>
-  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+  <!-- фиксируем версию, чтобы был метод addCandlestickSeries -->
+  <script src="https://unpkg.com/lightweight-charts@4.2.1/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
-<header>
+<header class="row">
   <strong>Crypto Engine Monitor</strong>
   <span id="status">connecting…</span>
   <span class="pill" id="symbol"></span>
+
+  <div class="legend">
+    <span class="row"><span class="dot entry"></span>ENTRY</span>
+    <span class="row"><span class="dot grid"></span>GRID</span>
+    <span class="row"><span class="dot tp"></span>TP</span>
+    <span class="row"><span class="dot sl"></span>SL</span>
+    <span class="row"><span class="dot be"></span>BE</span>
+  </div>
+
+  <label class="row" style="margin-left:auto">
+    <span>Timeframe</span>
+    <select id="tf">
+      <option value="1m" selected>1m</option>
+      <option value="5m">5m</option>
+      <option value="15m">15m</option>
+      <option value="1h">1h</option>
+    </select>
+  </label>
+
+  <button id="btnExport">Export events CSV</button>
 </header>
-<div id="chart"></div>
-<pre id="events"></pre>
+
+<main>
+  <section id="chartWrap">
+    <div id="chart"></div>
+    <pre id="events"></pre>
+  </section>
+
+  <aside>
+    <div class="panel" id="posPanel">
+      <h3>Position</h3>
+      <div id="posBox">loading…</div>
+    </div>
+
+    <div class="panel" id="ordersPanel">
+      <h3>Open Orders</h3>
+      <table id="ordersTable">
+        <thead><tr><th>Side</th><th>Price</th><th>Qty</th><th>Type</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </aside>
+</main>
 
 <script>
+if (!window.LightweightCharts || typeof LightweightCharts.createChart !== "function") {
+  console.error("LightweightCharts failed to load. Check network/CSP or the script tag URL.");
+}
+
 const qs = new URLSearchParams(location.search);
 const SYMBOL = qs.get("symbol") || "BTC/USDT:USDT";
-
 document.getElementById('symbol').textContent = SYMBOL;
 
 const chart = LightweightCharts.createChart(document.getElementById('chart'), {
   layout: { textColor: '#333', background: { type: 'solid', color: '#fff' } },
+  grid: { vertLines: { color: '#eee' }, horzLines: { color: '#eee' } },
   rightPriceScale: { borderVisible: false },
   timeScale: { borderVisible: false, timeVisible: true, secondsVisible: true }
 });
-const candleSeries = chart.addCandlestickSeries();
-const markers = [];
+const candles = chart.addCandlestickSeries();
+let markers = []; // keep and re-apply markers
 
-function addMarker(time, position, color, text) {
-  markers.push({ time, position, color, shape: 'circle', text });
-  candleSeries.setMarkers(markers);
+function setMarkers(newOnes) {
+  markers = markers.concat(newOnes);
+  candles.setMarkers(markers);
 }
 
-function tsToSec(ts) {
-  // timestamp may be ms or sec
-  return ts > 2e10 ? Math.floor(ts/1000) : ts;
+function evToMarker(ev) {
+  const t = Math.floor(new Date(ev.ts).getTime() / 1000);
+  let color = '#6c5ce7', label = 'ENTRY', shape = 'circle', position = 'aboveBar';
+  if (ev.type === 'tp')   { color='#0aa63a'; label='TP';   shape='circle'; }
+  if (ev.type === 'sl')   { color='#d63031'; label='SL';   shape='arrowDown'; }
+  if (ev.type === 'grid') { color='#0984e3'; label='GRID'; shape='circle'; }
+  if (ev.type === 'sl_move_be') { color='#f39c12'; label='BE'; shape='circle'; }
+  if (ev.type === 'entry') { color='#6c5ce7'; label='ENTRY'; shape='arrowUp'; position='belowBar'; }
+  return { time: t, position, color, shape, text: `${label} ${ev.price ?? ''}` };
 }
 
-async function loadHistory() {
-  // 1) Загрузим последние свечи через /ticker нет — тогда рисуем «спарк» из событий
-  // Пока просто грузим события и ставим маркеры + синтетические свечи
-  const res = await fetch('/events?limit=500');
-  const data = await res.json();
-  const events = data.filter(e => e.symbol === SYMBOL).reverse();
-
-  // Синтетические свечи из цен событий (fallback если нет OHLC)
-  const ohlc = [];
-  for (let i=0; i<events.length; i++) {
-    const t = tsToSec(Date.parse(events[i].ts || events[i].timestamp || new Date())/1000 || events[i].ts || Date.now());
-    const p = events[i].price || 0;
-    if (!p) continue;
-    ohlc.push({ time: t, open: p, high: p, low: p, close: p });
-  }
-  if (ohlc.length) candleSeries.setData(ohlc);
-
-  for (const ev of events) placeMarker(ev);
-}
-
-function placeMarker(ev) {
-  const time = tsToSec(Math.floor(new Date(ev.ts).getTime()/1000) || (ev.ts||Date.now())/1000);
-  const t = ev.type;
-  const price = ev.price;
-  if (!price) return;
-  let color = '#6c5ce7', label = 'ENTRY';
-  if (t==='tp') { color='#00b894'; label='TP'; }
-  else if (t==='sl') { color='#d63031'; label='SL'; }
-  else if (t==='grid') { color='#0984e3'; label='GRID'; }
-  else if (t==='sl_move_be') { color='#f39c12'; label='BE'; }
-  addMarker(time, 'aboveBar', color, `${label} ${price}`);
-  // log line
+function logEvent(ev) {
   const pre = document.getElementById('events');
-  pre.textContent = `${new Date(ev.ts).toLocaleString()}  ${t.toUpperCase()}  ${ev.side||''}  ${ev.price||''}  ${ev.qty||''}\n` + pre.textContent;
+  const line = `${new Date(ev.ts).toLocaleString()}  ${String(ev.type||'').toUpperCase()}  ${ev.side||''}  ${ev.price ?? ''}  ${ev.qty ?? ''}\n`;
+  pre.textContent = line + pre.textContent;
 }
 
-async function bootWS() {
-  const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${wsProto}://${location.host}/ws/stream`);
+async function loadCandles(tf) {
+  const r = await fetch(`/ohlcv?symbol=${encodeURIComponent(SYMBOL)}&timeframe=${encodeURIComponent(tf)}&limit=300`);
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  candles.setData(data.candles || []);
+}
+
+async function loadMarkersHistory() {
+  const r = await fetch(`/events?symbol=${encodeURIComponent(SYMBOL)}&limit=500`);
+  if (!r.ok) return;
+  const events = await r.json();
+  const ms = events.map(evToMarker);
+  markers = []; // reset before bulk apply
+  setMarkers(ms);
+}
+
+function connectWS() {
   const st = document.getElementById('status');
-  ws.onopen = () => st.textContent = 'connected';
-  ws.onclose = () => st.textContent = 'disconnected';
-  ws.onerror = () => st.textContent = 'error';
+  const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsUrl = `${wsProto}://${location.host}/ws/stream`;
+  const ws = new WebSocket(wsUrl);
+
+  ws.onopen = () => { st.textContent = 'connected'; };
+  ws.onclose = () => { st.textContent = 'disconnected (retrying…)'; setTimeout(connectWS, 1500); };
+  ws.onerror = () => { st.textContent = 'error'; };
+
   ws.onmessage = (m) => {
     try {
       const ev = JSON.parse(m.data);
       if (ev.symbol !== SYMBOL) return;
-      placeMarker(ev);
-    } catch(e) {}
+      setMarkers([evToMarker(ev)]);
+      logEvent(ev);
+    } catch (e) {}
   };
 }
 
-loadHistory().then(bootWS);
+async function refreshStatus() {
+  try {
+    const r = await fetch(`/status?symbol=${encodeURIComponent(SYMBOL)}`);
+    const data = await r.json();
+
+    // ---- position box ----
+    const posBox = document.getElementById('posBox');
+    let pos = Array.isArray(data.positions) ? data.positions : [];
+    pos = pos.filter(p => p.symbol === SYMBOL);
+    if (pos.length) {
+      const p = pos[0];
+      const side = (p.side || '').toUpperCase();
+      const size = +(p.contracts || p.size || 0);
+      const entry = +(p.entryPrice || 0);
+      const upnl = p.unrealizedPnl !== undefined ? +p.unrealizedPnl : (p.info && +p.info.unrealisedPnl) || 0;
+      posBox.innerHTML = `
+        <table>
+          <tr><th>Side</th><td>${side}</td></tr>
+          <tr><th>Size</th><td>${size}</td></tr>
+          <tr><th>Entry</th><td>${entry}</td></tr>
+          <tr><th>uPNL</th><td>${upnl}</td></tr>
+        </table>`;
+    } else {
+      posBox.textContent = 'No active position';
+    }
+
+    // ---- orders table ----
+    const tbody = document.querySelector('#ordersTable tbody');
+    tbody.innerHTML = '';
+    const orders = Array.isArray(data.orders) ? data.orders : [];
+    orders.forEach(o => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${(o.side||'').toUpperCase()}</td>
+                      <td>${o.price ?? ''}</td>
+                      <td>${o.amount ?? ''}</td>
+                      <td>${o.type ?? ''}</td>`;
+      tbody.appendChild(tr);
+    });
+  } catch (e) {
+    // ignore transient errors
+  }
+}
+
+async function exportCSV() {
+  const r = await fetch(`/events?symbol=${encodeURIComponent(SYMBOL)}&limit=2000`);
+  if (!r.ok) return;
+  const rows = await r.json();
+  const header = ['ts','type','symbol','side','price','qty'];
+  const csv = [header.join(',')].concat(
+    rows.map(e => [
+      e.ts, e.type, e.symbol,
+      e.side ?? '',
+      e.price ?? '',
+      e.qty ?? ''
+    ].join(','))
+  ).join('\n');
+
+  const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `events_${SYMBOL.replace(/[/:]/g,'_')}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function boot() {
+  const tfSel = document.getElementById('tf');
+  document.getElementById('btnExport').addEventListener('click', exportCSV);
+
+  // initial load
+  try {
+    await loadCandles(tfSel.value);
+    await loadMarkersHistory();
+    await refreshStatus();
+  } catch (e) { console.error(e); }
+
+  // ws realtime
+  connectWS();
+
+  // timeframe change
+  tfSel.addEventListener('change', async () => {
+    try { await loadCandles(tfSel.value); candles.setMarkers(markers); } catch (e) { console.error(e); }
+  });
+
+  // periodic status refresh
+  setInterval(refreshStatus, 5000);
+}
+boot();
 </script>
 </body>
 </html>
