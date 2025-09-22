@@ -183,7 +183,7 @@ docker logs -f crypto-engine
 5. `05_sl_trailing.png` → SL to breakeven or SL hit logs  
 6. `06_config_file.png` → config.example.json in editor  
 7. `07_docker_ps.png` → `docker ps` with running container  
-8. `08_chart_with_entries.png` → chart with Entry, TP, Grid levels (optional)  
+
 
 ---
 
